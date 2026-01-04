@@ -37,16 +37,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        env:
-          user: ${{ secrets.DOCKERHUB_USERNAME }}
-          token: ${{ secrets.DOCKERHUB_TOKEN }}
-        if: ${{ env.user != '' && env.token != '' }}
-
       - name: Set Repository Owner and Name in Lowercase
         run: |
           REPO_OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
@@ -54,34 +44,25 @@ jobs:
           REPO_NAME=$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')
           echo "REPO_NAME=${REPO_NAME}" >> $GITHUB_ENV
 
-      - name: Set version
-        id: set_version
-        run: |
-          # Get version from input or payload
-          VERSION="${{ github.event.inputs.build_version || github.event.client_payload.caddy_version }}"
+      - name: Resolve Caddy version (input/dispatch/latest)
+        id: resolve_version
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const inputVersion = context.payload?.inputs?.build_version;
+            const dispatchVersion = context.payload?.client_payload?.caddy_version;
+            let v = (inputVersion || dispatchVersion || "").toString().trim();
+            if (!v) {
+              core.info("No version provided. Fetching latest Caddy release...");
+              const rel = await github.rest.repos.getLatestRelease({ owner: "caddyserver", repo: "caddy" });
+              v = rel?.data?.tag_name || "";
+            }
+            if (!v) core.setFailed("Could not resolve Caddy version.");
+            const normalized = v.startsWith("v") ? v.slice(1) : v;
+            core.setOutput("version", normalized);
 
-          # Exit if no version specified
-          if [ -z "$VERSION" ]; then
-            echo "No version specified. Exiting."
-            exit 1
-          fi
-
-          # Strip v prefix if present
-          VERSION="${VERSION#v}"
-          echo "VERSION=${VERSION}" >> $GITHUB_ENV
-
-      - name: Set Docker Hub image (if credentials exist)
-        run: |
-          # Check if Docker Hub credentials are provided
-          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
-            if [ -n "${{ secrets.DOCKERHUB_REPOSITORY_NAME }}" ]; then
-              echo "DOCKERHUB_IMAGE=${{ secrets.DOCKERHUB_REPOSITORY_NAME }}" >> $GITHUB_ENV
-            else
-              echo "DOCKERHUB_IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.REPO_NAME }}" >> $GITHUB_ENV
-            fi
-          else
-            echo "Warning: DOCKERHUB_USERNAME or DOCKERHUB_TOKEN not set. Docker Hub image will not be pushed."
-          fi
+      - name: Set version env
+        run: echo "VERSION=${{ steps.resolve_version.outputs.version }}" >> $GITHUB_ENV
 
       - name: Docker Metadata
         id: meta
@@ -89,7 +70,6 @@ jobs:
         with:
           images: |
             ghcr.io/${{ env.REPO_OWNER }}/${{ env.REPO_NAME }}
-            ${{ env.DOCKERHUB_IMAGE }}
           flavor: |
             latest=false
           tags: |

@@ -17,49 +17,44 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.x
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - name: Install Python dependencies
-        run: pip install requests
-
-      - name: Set DOCKERHUB_REPOSITORY_NAME with fallback
-        run: |
-          echo "DOCKERHUB_REPOSITORY_NAME=${DOCKERHUB_REPOSITORY_NAME:-caddybuilds/caddy-cloudflare}" >> $GITHUB_ENV
-        env:
-          DOCKERHUB_REPOSITORY_NAME: ${{ vars.DOCKERHUB_REPOSITORY_NAME || secrets.DOCKERHUB_REPOSITORY_NAME }}
-
-      - name: Check Caddy release status (GitHub & Docker Hub)
-        id: check_script
-        env:
-          DOCKERHUB_REPOSITORY_NAME: ${{ env.DOCKERHUB_REPOSITORY_NAME }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python scripts/check_caddy_status.py
-
-      - name: Trigger Build Workflow if Needed
-        # Run this step ONLY if the script output NEEDS_BUILD is 'true'
-        if: steps.check_script.outputs.NEEDS_BUILD == 'true'
+      - name: Check latest Caddy release and dispatch build (GHCR only)
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const version = '${{ steps.check_script.outputs.LATEST_VERSION }}';
-            console.log(`Build required for Caddy version: ${version}. Dispatching event...`);
+            const upstream = await github.rest.repos.getLatestRelease({ owner: "caddyserver", repo: "caddy" });
+            const upstreamTag = upstream?.data?.tag_name || "";
+            if (!upstreamTag) core.setFailed("Could not fetch latest Caddy release tag.");
+
+            const normalized = upstreamTag.startsWith("v") ? upstreamTag.slice(1) : upstreamTag;
+            core.info(`Latest upstream Caddy tag: ${upstreamTag} (normalized: ${normalized})`);
+
+            // We use a GitHub Release in THIS repo (tag = normalized version, e.g. "2.11.0")
+            // as the build marker. If it already exists, skip dispatch.
+            let needsBuild = false;
             try {
-              await github.rest.repos.createDispatchEvent({
+              await github.rest.repos.getReleaseByTag({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                event_type: 'caddy-release',
-                client_payload: {
-                  caddy_version: version // Pass the tag (e.g., "v2.9.1")
-                }
+                tag: normalized,
               });
-              console.log(`Successfully dispatched event for ${version}.`);
-            } catch (error) {
-              core.setFailed(`Failed to dispatch event: ${error.message}`);
+              core.info(`Release '${normalized}' already exists in this repo; skipping dispatch.`);
+            } catch (e) {
+              if (e?.status === 404) {
+                needsBuild = true;
+                core.info(`Release '${normalized}' not found in this repo; dispatching build.`);
+              } else {
+                core.setFailed(`Failed checking release '${normalized}': ${e.message}`);
+              }
             }
+
+            if (!needsBuild) return;
+
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: "caddy-release",
+              client_payload: {
+                caddy_version: upstreamTag, // keep "v" prefix for clarity; build workflow normalizes
+              },
+            });
